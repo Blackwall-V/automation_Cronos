@@ -8,14 +8,15 @@ Que hace:
     2. Agrupa las fotos por ID de cliente (el numero antes de sufijos
        tipo (1), (2), -1, _1, " 1", etc).
     3. Para cada ID: busca el cliente en el sistema, revisa si YA tiene
-       imagenes adjuntas. Si la ventana "Imágenes del cliente <ID>" se abre,
-       la cierra de inmediato y pasa al siguiente ID. Si no tiene imagenes,
-       adjunta las fotos nuevas (maximo 3, maximo 5MB cada una).
+       imagenes adjuntas. Si tiene imagenes, cierra UNICAMENTE la ventana
+       emergente de imagenes sin afectar la ventana principal y pasa al siguiente ID.
+       Si no tiene imagenes, adjunta las fotos nuevas (maximo 3, maximo 5MB cada una)
+       forzando el foco en la casilla 'Nombre:' (Alt+N) y limpiando el campo.
     4. Deja un registro (procesados.csv) y genera un reporte Excel (.xlsx)
        con el ID, si se subio, si necesita revision y el detalle.
 
 Requiere:
-    pip install pywinauto openpyxl
+    pip install pywinauto openpyxl pywin32
 """
 
 import csv
@@ -38,17 +39,17 @@ except Exception:
         pass
 
 # ---------------------------------------------------------------------------
-# CONFIG - AJUSTAR AQUI SI ALGO NO CALZA CON LO QUE VE EN PANTALLA
+# CONFIGURACIÓN GENERAL
 # ---------------------------------------------------------------------------
 
-CARPETA_FOTOS_BASE = r"C:\Users\Victor Segovia\Documents\carpeta test 1\carpeta test 2"
+CARPETA_FOTOS_BASE = r"C:\Users\eramirez\Documents\FOTOS"
 
 MAX_ARCHIVOS_POR_ID = 3
 MAX_TAMANO_MB = 5
 
 ARCHIVO_REGISTRO = "procesados.csv"
 
-# Textos / titulos de la app (para pywinauto)
+# Textos / títulos de la app (para pywinauto)
 TITULO_VENTANA_PRINCIPAL_REGEX = r".*Consultas.*"
 NOMBRE_CAMPO_NRO = "Nro:"
 NOMBRE_BOTON_ADJUNTAR = "Adjuntar imágen"
@@ -88,7 +89,6 @@ class ResultadoID:
 # PASO 1: ESCANEO Y AGRUPAMIENTO DE ARCHIVOS
 # ---------------------------------------------------------------------------
 
-# Reconoce sufijos tipo: (1), (2), -1, _1, " 1", "-1 "
 PATRON_SUFIJO = re.compile(
     r"""^
     (?P<id>\d+)                      # el ID: uno o mas digitos al inicio
@@ -191,7 +191,7 @@ def registrar_resultado(id_cliente: str, archivo: str, estado: str, detalle: str
 
 
 # ---------------------------------------------------------------------------
-# PASO 3: AUTOMATIZACION DE LA VENTANA (pywinauto)
+# PASO 3: AUTOMATIZACIÓN DE LA VENTANA (pywinauto + win32gui)
 # ---------------------------------------------------------------------------
 
 
@@ -200,6 +200,7 @@ class AutomatizadorApp:
         self.app = None
         self.ventana_principal = None
         self.ventana_principal_uia = None
+        self.main_handle = None
 
     def conectar(self):
         import win32gui
@@ -222,14 +223,16 @@ class AutomatizadorApp:
             TIMEOUT_ESPERA, 0.5, _buscar_ventana_valida
         )
 
+        self.main_handle = elemento_valido.handle
+
         self.app = Application(backend="win32").connect(
-            handle=elemento_valido.handle, timeout=TIMEOUT_ESPERA
+            handle=self.main_handle, timeout=TIMEOUT_ESPERA
         )
-        self.ventana_principal = self.app.window(handle=elemento_valido.handle)
+        self.ventana_principal = self.app.window(handle=self.main_handle)
         self.ventana_principal.wait("exists ready", timeout=TIMEOUT_ESPERA)
 
         self.ventana_principal_uia = Desktop(backend="uia").window(
-            handle=elemento_valido.handle
+            handle=self.main_handle
         )
         self.ventana_principal_uia.wait("exists ready", timeout=TIMEOUT_ESPERA)
 
@@ -285,6 +288,12 @@ class AutomatizadorApp:
         return mejor
 
     def buscar_cliente(self, id_cliente: str) -> bool:
+        try:
+            self.ventana_principal.set_focus()
+            time.sleep(PAUSA_CORTA)
+        except Exception:
+            pass
+
         campo_nro = self._campo_edit_por_etiqueta(NOMBRE_CAMPO_NRO)
         campo_nro.set_focus()
         campo_nro.set_edit_text("")
@@ -337,76 +346,49 @@ class AutomatizadorApp:
 
         raise RuntimeError(f"Se clickeo {texto_boton!r} pero no abrio nada nuevo.")
 
-    def _cerrar_ventana(self, ventana):
-        """Intenta cerrar una ventana emergente usando multiples estrategias
-        para garantizar que no quede abierta bloqueando la app."""
-        if not ventana.exists():
-            return
-
-        # 1. Buscar botones clasicos de cierre ('Cerrar', 'Aceptar', 'Salir')
-        for texto_boton in [NOMBRE_BOTON_CERRAR_POPUP, NOMBRE_BOTON_ACEPTAR_POPUP, "Salir"]:
-            try:
-                boton = self._buscar_boton(ventana, texto_boton)
-                boton.click_input()
-                time.sleep(PAUSA_CORTA)
-                if not ventana.exists():
-                    return
-            except Exception:
-                pass
-
-        # 2. Enviar la tecla ESC
-        try:
-            ventana.set_focus()
-            ventana.type_keys("{ESC}")
-            time.sleep(PAUSA_CORTA)
-            if not ventana.exists():
-                return
-        except Exception:
-            pass
-
-        # 3. Enviar Alt + F4
-        try:
-            ventana.set_focus()
-            ventana.type_keys("%{F4}")
-            time.sleep(PAUSA_CORTA)
-            if not ventana.exists():
-                return
-        except Exception:
-            pass
-
-        # 4. Metodo .close() directo de pywinauto
-        try:
-            ventana.close()
-            time.sleep(PAUSA_CORTA)
-        except Exception:
-            pass
-
-    def contar_imagenes_adjuntas((self, id_cliente: str = "") -> int:
+    def contar_imagenes_adjuntas(self, id_cliente: str = "") -> int:
         """Abre 'Ver imagen(es)':
-        - Si NO tiene imagenes: abre un MessageBox ('No existen archivos adjuntos'),
-          lo cierra con Aceptar/Enter y devuelve 0.
-        - Si YA tiene imagenes: abre la ventana 'Imágenes del cliente <ID>'
-          (o 'Imagenes del cliente <ID>'), la cierra de inmediato y devuelve las filas (>0).
+        - Si sale la ventana 'No existen archivos adjuntos': la cierra y devuelve 0.
+        - Si sale la ventana 'Imágenes del cliente' (tiene imágenes):
+          la cierra de forma segura mediante WM_CLOSE dirigiéndose exclusivamente a ella
+          (sin riesgo de cerrar la ventana principal) y devuelve 1.
         """
+        import win32con
+        import win32gui
+
         self._click_boton_toolstrip(NOMBRE_BOTON_VER_IMAGENES)
         time.sleep(PAUSA_CORTA * 2)
 
-        ventana_top = self._obtener_ventana_top_valida()
-        ventana_top.wait("exists ready", timeout=TIMEOUT_ESPERA)
+        ventana_emergente = None
+        for _ in range(15):
+            try:
+                top = self._obtener_ventana_top_valida()
+                if top.handle != self.main_handle:
+                    ventana_emergente = top
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
 
-        # Caso (a): MessageBox de "No existen archivos adjuntos"
+        if ventana_emergente is None:
+            return 0
+
+        # CASO 1: Ventana de "No existen archivos adjuntos" (MessageBox)
         try:
-            boton_aceptar = self._buscar_boton(ventana_top, NOMBRE_BOTON_ACEPTAR_POPUP)
+            boton_aceptar = self._buscar_boton(ventana_emergente, NOMBRE_BOTON_ACEPTAR_POPUP)
         except RuntimeError:
             boton_aceptar = None
 
         if boton_aceptar is not None:
-            ventana_top.set_focus()
-            time.sleep(PAUSA_CORTA)
-            ventana_top.type_keys("{ENTER}")
-            time.sleep(PAUSA_CORTA * 2)
+            try:
+                ventana_emergente.set_focus()
+                time.sleep(0.2)
+                ventana_emergente.type_keys("{ENTER}")
+                time.sleep(PAUSA_CORTA)
+            except Exception:
+                pass
 
-            if ventana_top.exists():
+            if ventana_emergente.exists() and ventana_emergente.handle != self.main_handle:
                 try:
                     boton_aceptar.click()
                     time.sleep(PAUSA_CORTA)
@@ -415,22 +397,27 @@ class AutomatizadorApp:
 
             return 0
 
-        # Caso (b): Se abrio la ventana "Imágenes del cliente <ID>"
-        filas = 0
+        # CASO 2: Apareció la ventana "Imágenes del cliente" (SÍ tiene imágenes)
         try:
-            tabla = ventana_top.child_window(class_name="DataGridView")
-            tabla.wait("exists", timeout=TIMEOUT_ESPERA)
-            filas = tabla.row_count()
+            h_popup = ventana_emergente.handle
+            if h_popup != self.main_handle:
+                win32gui.PostMessage(h_popup, win32con.WM_CLOSE, 0, 0)
+                time.sleep(PAUSA_CORTA * 2)
+
+            if ventana_emergente.exists() and ventana_emergente.handle != self.main_handle:
+                ventana_emergente.set_focus()
+                time.sleep(0.2)
+                ventana_emergente.type_keys("%{F4}")
+                time.sleep(PAUSA_CORTA)
+        except Exception as e:
+            print(f"Aviso al cerrar ventana emergente: {e}")
+
+        try:
+            self.ventana_principal.set_focus()
         except Exception:
-            # Si no se pudo leer la tabla exacta pero se abrio la ventana de imagenes
-            # asumimos al menos 1 para considerar que ya tenia y cerrar de forma segura.
-            filas = 1
+            pass
 
-        # Cierre garantizado de la ventana "Imágenes del cliente <ID>"
-        self._cerrar_ventana(ventana_top)
-        time.sleep(PAUSA_CORTA)
-
-        return filas
+        return 1
 
     def _click_boton_explorar(self, ventana_adjuntar):
         for _ in range(2):
@@ -448,7 +435,51 @@ class AutomatizadorApp:
 
         raise RuntimeError("No aparecio el dialogo del explorador.")
 
-    def adjuntar_archivo(self, ruta_archivo: str):
+    def _escribir_ruta_en_dialogo(self, dialogo, ruta_absoluta: str):
+        """Escribe la ruta del archivo en el campo 'Nombre:' del dialogo del
+        Explorador de Windows.
+
+        En vez de simular Alt+N (que depende de donde haya quedado el foco
+        la ultima vez que se abrio el dialogo en ese equipo -a veces queda
+        en la barra de direcciones/breadcrumb de arriba y todo lo tecleado
+        se va ahi en lugar del campo de nombre-), se ubica directamente el
+        control real por su AutomationId. El campo 'Nombre:' del dialogo
+        moderno de Windows (comdlg32 / IFileDialog) tiene AutomationId
+        '1001' de forma fija, sin importar el idioma de Windows.
+        """
+        from pywinauto import Desktop
+
+        try:
+            dialogo_uia = Desktop(backend="uia").window(handle=dialogo.handle)
+            dialogo_uia.wait("exists ready", timeout=TIMEOUT_ESPERA)
+
+            campo_nombre = dialogo_uia.child_window(auto_id="1001", control_type="Edit")
+            campo_nombre.wait("exists ready", timeout=5)
+
+            campo_nombre.set_focus()
+            time.sleep(PAUSA_CORTA)
+            campo_nombre.set_edit_text(ruta_absoluta)
+            time.sleep(PAUSA_CORTA)
+            campo_nombre.type_keys("{ENTER}")
+            return
+        except Exception:
+            pass
+
+        # --- Fallback: metodo antiguo por si en algun equipo no aparece
+        # el control con ese AutomationId (version de Windows distinta, etc).
+        dialogo.set_focus()
+        time.sleep(PAUSA_CORTA)
+        dialogo.type_keys("%n", set_foreground=True)
+        time.sleep(PAUSA_CORTA)
+        dialogo.type_keys("^a{BACKSPACE}", set_foreground=True)
+        time.sleep(PAUSA_CORTA)
+        dialogo.type_keys(ruta_absoluta, with_spaces=True, set_foreground=True)
+        time.sleep(PAUSA_CORTA)
+        dialogo.type_keys("{ENTER}")
+
+    def adjuntar_archivo(self, ruta_archivo: str, carpeta_mes: str = ""):
+        """Abre 'Adjuntar imágen', navega mediante explorador de Windows,
+        forzando foco en la casilla 'Nombre:' con Alt+N y limpiando el campo con Ctrl+A + Backspace."""
         self._click_boton_toolstrip(NOMBRE_BOTON_ADJUNTAR)
         time.sleep(PAUSA_CORTA * 2)
 
@@ -459,11 +490,16 @@ class AutomatizadorApp:
 
         dialogo = self.app.window(class_name="#32770")
         dialogo.wait("exists ready", timeout=TIMEOUT_ESPERA)
-        dialogo.type_keys(ruta_archivo, with_spaces=True, set_foreground=True)
+
+        ruta_absoluta = os.path.abspath(ruta_archivo)
+
+        dialogo.set_focus()
         time.sleep(PAUSA_CORTA)
-        dialogo.type_keys("{ENTER}")
+
+        self._escribir_ruta_en_dialogo(dialogo, ruta_absoluta)
         time.sleep(PAUSA_CORTA * 2)
 
+        # 4. Presiona el botón "Agregar"
         boton_agregar = None
         for _ in range(10):
             try:
@@ -478,6 +514,7 @@ class AutomatizadorApp:
         boton_agregar.click_input()
         time.sleep(PAUSA_CORTA * 2)
 
+        # 5. Cierra la ventana emergente de adjuntar
         boton_cerrar = self._buscar_boton(ventana_adjuntar, NOMBRE_BOTON_CERRAR_POPUP)
         boton_cerrar.click()
         time.sleep(PAUSA_CORTA)
@@ -542,20 +579,17 @@ def procesar_mes(nombre_mes: str, modo_solo_revisar: bool):
                 resultados.append(ResultadoID(id_cliente, "NO_ENCONTRADO", "ID no encontrado en el sistema"))
                 continue
 
-            # Revisa si ya tiene imagenes. Si tiene, la ventana "Imágenes del cliente <ID>"
-            # se cierra de inmediato dentro de contar_imagenes_adjuntas() y se pasa al siguiente ID.
             filas_antes = automatizador.contar_imagenes_adjuntas(id_cliente)
             if filas_antes > 0:
                 for a in archivos_pendientes:
                     registrar_resultado(id_cliente, a, "OMITIDO_YA_TENIA",
-                                         f"Ya tenia {filas_antes} imagen(es) adjunta(s)")
+                                         "El cliente ya tenia imagenes adjuntas")
                 resultados.append(ResultadoID(id_cliente, "OMITIDO_YA_TENIA",
-                                   f"El cliente ya tenia {filas_antes} imagen(es) en el sistema"))
+                                   "El cliente ya tenia imagenes en el sistema"))
                 continue
 
-            # Subida de imagenes
             for archivo in archivos_pendientes:
-                automatizador.adjuntar_archivo(archivo)
+                automatizador.adjuntar_archivo(archivo, carpeta_mes)
 
             for a in archivos_pendientes:
                 registrar_resultado(id_cliente, a, "OK", "")
@@ -642,7 +676,7 @@ def generar_reporte_excel(nombre_mes: str, resultados: list[ResultadoID], no_rec
 
 
 # ---------------------------------------------------------------------------
-# PASO 5: MENU DE CONSOLA
+# PASO 5: MENÚ DE CONSOLA
 # ---------------------------------------------------------------------------
 
 
